@@ -1,0 +1,29 @@
+# Chat conversation tracking (excluded from version control)
+chat-conversation.md
+
+# Build outputs (C)
+c/ast-analyzer
+c/ast-analyzer.exe
+c/build/
+c/test/build/
+*.exe
+*.o
+*.obj
+build/
+dist/
+
+# Generated JavaScript outputs
+*.js
+!c/test/*.js
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
