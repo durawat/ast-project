@@ -5,42 +5,6 @@
 #include <ctype.h>
 #include <stdarg.h>
 
-// Keyword indices
-typedef enum {
-    KW_INTERFACE,
-    KW_TYPE,
-    KW_IMPLEMENTS,
-    KW_AS,
-    KW_PRIVATE,
-    KW_COUNT
-} KeywordIndex;
-
-// Pattern indices
-typedef enum {
-    PATTERN_COLON,        // : type annotations
-    PATTERN_GENERICS,     // <> generic parameters
-    PATTERN_OPTIONAL,     // ?: optional parameters
-    PATTERN_COUNT
-} PatternIndex;
-
-// TypeScript/Flow keywords to strip
-static const char *KEYWORDS_TO_STRIP[] = {
-    [KW_INTERFACE] = "interface",
-    [KW_TYPE] = "type",
-    [KW_IMPLEMENTS] = "implements",
-    [KW_AS] = "as",
-    [KW_PRIVATE] = "private",
-    [KW_COUNT] = NULL
-};
-
-// Special characters/patterns to strip
-static const char *PATTERNS_TO_STRIP[] = {
-    [PATTERN_COLON] = ":",
-    [PATTERN_GENERICS] = "<>",
-    [PATTERN_OPTIONAL] = "?:",
-    [PATTERN_COUNT] = NULL
-};
-
 typedef struct {
     char *buffer;
     size_t size;
@@ -92,282 +56,473 @@ char* sb_to_string(StringBuilder *sb) {
     return result;
 }
 
-// Parser states for TypeScript type stripper
-typedef enum {
-    STATE_CODE,           // Normal code
-    STATE_STRING,         // Inside string literal
-    STATE_BLOCK_COMMENT,  // Inside /* */ comment
-    STATE_LINE_COMMENT    // Inside // comment
-} ParserState;
+// ============================================================================
+// LEXER: Tokenize source code into AST
+// ============================================================================
 
-// Forward declaration
-static int process_code_token(const char **ptr, const char *end, const char *source, StringBuilder *output);
+static void ast_add_token(AST *ast, TokenType type, const char *start, size_t length, int line) {
+    if (ast->count >= ast->capacity) {
+        ast->capacity *= 2;
+        Token *new_tokens = realloc(ast->tokens, ast->capacity * sizeof(Token));
+        if (!new_tokens) return;
+        ast->tokens = new_tokens;
+    }
+    
+    ast->tokens[ast->count].type = type;
+    ast->tokens[ast->count].start = start;
+    ast->tokens[ast->count].length = length;
+    ast->tokens[ast->count].line = line;
+    ast->count++;
+}
 
-// TypeScript/Flow type stripper
-char* strip_types(const char *source, size_t size) {
+AST* lex(const char *source, size_t size) {
     if (!source || size == 0) {
         return NULL;
     }
-
-    StringBuilder *output = sb_create(size);
-    if (!output) {
+    
+    AST *ast = malloc(sizeof(AST));
+    if (!ast) return NULL;
+    
+    ast->capacity = 256;
+    ast->count = 0;
+    ast->tokens = malloc(ast->capacity * sizeof(Token));
+    if (!ast->tokens) {
+        free(ast);
         return NULL;
     }
-
+    
     const char *ptr = source;
     const char *end = source + size;
-    ParserState state = STATE_CODE;
+    int line = 1;
+    
+    typedef enum {
+        STATE_CODE,
+        STATE_STRING,
+        STATE_BLOCK_COMMENT,
+        STATE_LINE_COMMENT
+    } LexerState;
+    
+    LexerState state = STATE_CODE;
     char string_delimiter = 0;
-
+    const char *token_start = ptr;
+    
     while (ptr < end) {
         char current = *ptr;
         char next = (ptr + 1 < end) ? *(ptr + 1) : '\0';
-
-        // State transitions
+        
         switch (state) {
             case STATE_CODE:
-                // Transition to string state
+                // String literals
                 if ((current == '"' || current == '\'' || current == '`') && 
                     (ptr == source || *(ptr - 1) != '\\')) {
                     state = STATE_STRING;
                     string_delimiter = current;
-                    sb_append_format(output, "%c", current);
+                    token_start = ptr;
                     ptr++;
                     continue;
                 }
                 
-                // Transition to block comment
+                // Block comments
                 if (current == '/' && next == '*') {
                     state = STATE_BLOCK_COMMENT;
-                    sb_append(output, "/*");
+                    token_start = ptr;
                     ptr += 2;
                     continue;
                 }
                 
-                // Transition to line comment
+                // Line comments
                 if (current == '/' && next == '/') {
                     state = STATE_LINE_COMMENT;
-                    sb_append(output, "//");
+                    token_start = ptr;
                     ptr += 2;
                     continue;
                 }
                 
-                // Process code (strip types)
-                if (!process_code_token(&ptr, end, source, output)) {
-                    sb_append_format(output, "%c", current);
+                // Keywords
+                if (strncmp(ptr, "interface", 9) == 0 && (ptr + 9 >= end || (!isalnum(*(ptr + 9)) && *(ptr + 9) != '_'))) {
+                    ast_add_token(ast, TOKEN_INTERFACE, ptr, 9, line);
+                    ptr += 9;
+                    continue;
+                }
+                
+                if (strncmp(ptr, "type ", 5) == 0) {
+                    ast_add_token(ast, TOKEN_TYPE, ptr, 4, line);
+                    ptr += 4;
+                    continue;
+                }
+                
+                if (strncmp(ptr, "implements ", 11) == 0) {
+                    ast_add_token(ast, TOKEN_IMPLEMENTS, ptr, 10, line);
+                    ptr += 10;
+                    continue;
+                }
+                
+                if (ptr + 3 < end && ptr > source && *(ptr - 1) == ' ' && 
+                    strncmp(ptr, "as ", 3) == 0) {
+                    ast_add_token(ast, TOKEN_AS, ptr, 2, line);
+                    ptr += 2;
+                    continue;
+                }
+                
+                if (strncmp(ptr, "private", 7) == 0 && (ptr + 7 >= end || (!isalnum(*(ptr + 7)) && *(ptr + 7) != '_'))) {
+                    ast_add_token(ast, TOKEN_PRIVATE, ptr, 7, line);
+                    ptr += 7;
+                    continue;
+                }
+                
+                // Patterns
+                if (current == '?' && next == ':') {
+                    ast_add_token(ast, TOKEN_OPTIONAL, ptr, 2, line);
+                    ptr += 2;
+                    continue;
+                }
+                
+                if (current == ':') {
+                    // Check if it's a type annotation (after identifier/paren/bracket)
+                    const char *check = ptr - 1;
+                    while (check >= source && isspace(*check)) check--;
+                    if (check >= source && (isalnum(*check) || *check == '_' || *check == ')' || *check == ']')) {
+                        ast_add_token(ast, TOKEN_COLON, ptr, 1, line);
+                        ptr++;
+                        continue;
+                    }
+                }
+                
+                // Emit specific tokens for operators the parser needs to track
+                if (current == '<') {
+                    ast_add_token(ast, TOKEN_LT, ptr, 1, line);
+                    ptr++;
+                    continue;
+                }
+                
+                if (current == '>') {
+                    ast_add_token(ast, TOKEN_GT, ptr, 1, line);
+                    ptr++;
+                    continue;
+                }
+                
+                if (current == '=') {
+                    ast_add_token(ast, TOKEN_EQ, ptr, 1, line);
+                    ptr++;
+                    continue;
+                }
+                
+                // Regular code (identifiers, other operators, literals, etc.)
+                token_start = ptr;
+                ast_add_token(ast, TOKEN_CODE, token_start, 1, line);
+                ptr++;
+                break;
+                
+            case STATE_STRING:
+                if (current == string_delimiter && (ptr == source || *(ptr - 1) != '\\')) {
+                    ptr++;
+                    ast_add_token(ast, TOKEN_STRING, token_start, ptr - token_start, line);
+                    state = STATE_CODE;
+                } else {
                     ptr++;
                 }
                 break;
-
-            case STATE_STRING:
-                sb_append_format(output, "%c", current);
-                // Transition back to code when string ends
-                if (current == string_delimiter && (ptr == source || *(ptr - 1) != '\\')) {
-                    state = STATE_CODE;
-                }
-                ptr++;
-                break;
-
+                
             case STATE_BLOCK_COMMENT:
-                sb_append_format(output, "%c", current);
-                // Transition back to code when comment ends
                 if (current == '*' && next == '/') {
-                    sb_append_format(output, "%c", next);
-                    state = STATE_CODE;
                     ptr += 2;
-                    continue;
-                }
-                ptr++;
-                break;
-
-            case STATE_LINE_COMMENT:
-                sb_append_format(output, "%c", current);
-                // Transition back to code at newline
-                if (current == '\n') {
+                    ast_add_token(ast, TOKEN_BLOCK_COMMENT, token_start, ptr - token_start, line);
                     state = STATE_CODE;
+                } else {
+                    if (current == '\n') line++;
+                    ptr++;
                 }
-                ptr++;
+                break;
+                
+            case STATE_LINE_COMMENT:
+                if (current == '\n') {
+                    ast_add_token(ast, TOKEN_LINE_COMMENT, token_start, ptr - token_start, line);
+                    line++;
+                    ptr++;
+                    state = STATE_CODE;
+                } else {
+                    ptr++;
+                }
                 break;
         }
+        
+        if (current == '\n' && state == STATE_CODE) {
+            line++;
+        }
     }
-
-    return sb_to_string(output);
+    
+    ast_add_token(ast, TOKEN_EOF, ptr, 0, line);
+    return ast;
 }
 
-// Process a code token and strip TypeScript types
-// Returns 1 if token was processed and ptr was advanced, 0 otherwise
-static int process_code_token(const char **ptr, const char *end, const char *source, StringBuilder *output) {
-    const char *p = *ptr;
+// ============================================================================
+// PARSER: Process AST and strip types
+// ============================================================================
 
-    // Skip "interface" declarations
-    if (strncmp(p, KEYWORDS_TO_STRIP[KW_INTERFACE], 9) == 0 && (p + 9 >= end || (!isalnum(*(p + 9)) && *(p + 9) != '_'))) {
-        int brace_count = 0;
-        int found_brace = 0;
-        while (p < end) {
-            if (*p == '{') {
-                brace_count++;
-                found_brace = 1;
-            } else if (*p == '}') {
-                brace_count--;
-                if (found_brace && brace_count == 0) {
-                    p++;
-                    break;
+char* parse(const AST *ast, const char *source) {
+    if (!ast || !source) {
+        return NULL;
+    }
+    
+    StringBuilder *output = sb_create(4096);
+    if (!output) {
+        return NULL;
+    }
+    
+    for (size_t i = 0; i < ast->count; i++) {
+        Token token = ast->tokens[i];
+        
+        switch (token.type) {
+            case TOKEN_STRING:
+            case TOKEN_BLOCK_COMMENT:
+            case TOKEN_LINE_COMMENT:
+            case TOKEN_CODE:
+            case TOKEN_GT:
+            case TOKEN_EQ:
+                // Preserve these tokens (output as-is)
+                for (size_t j = 0; j < token.length; j++) {
+                    sb_append_format(output, "%c", token.start[j]);
                 }
-            } else if (*p == '\n' && !found_brace) {
-                p++;
                 break;
-            }
-            p++;
-        }
-        *ptr = p;
-        return 1;
-    }
-
-    // Skip "type" declarations
-    if (strncmp(p, KEYWORDS_TO_STRIP[KW_TYPE], 4) == 0 && (p + 4 < end && *(p + 4) == ' ')) {
-        while (p < end && *p != ';' && *p != '\n') {
-            p++;
-        }
-        if (p < end && *p == ';') p++;
-        *ptr = p;
-        return 1;
-    }
-
-    // Strip type annotations after colons (":") 
-    if (*p == PATTERNS_TO_STRIP[PATTERN_COLON][0]) {
-        const char *check = p - 1;
-        while (check >= source && isspace(*check)) check--;
-        
-        if (check >= source && (isalnum(*check) || *check == '_' || *check == ')' || *check == ']')) {
-            p++; // skip colon
-            while (p < end && isspace(*p)) p++;
-            
-            // Skip the type expression
-            int angle_brackets = 0, parens = 0, brackets = 0;
-            
-            while (p < end) {
-                if (*p == '<') angle_brackets++;
-                else if (*p == '>') {
-                    if (angle_brackets > 0) angle_brackets--;
-                    else break;
-                }
-                else if (*p == '(') parens++;
-                else if (*p == ')') {
-                    if (parens > 0) parens--;
-                    else break;
-                }
-                else if (*p == '[') brackets++;
-                else if (*p == ']') {
-                    if (brackets > 0) brackets--;
-                    else break;
-                }
-                else if (((*p == ',' || *p == ';' || *p == '{' || *p == '}' || *p == '=' || *p == '\n') && 
-                         angle_brackets == 0 && parens == 0 && brackets == 0)) {
-                    break;
-                }
-                p++;
-            }
-            *ptr = p;
-            return 1;
-        }
-    }
-
-    // Strip generic type parameters ("<>")
-    if (*p == PATTERNS_TO_STRIP[PATTERN_GENERICS][0]) {
-        const char *check = p - 1;
-        while (check >= source && isspace(*check)) check--;
-        
-        if (check >= source && (isalnum(*check) || *check == '_')) {
-            const char *lookahead = p + 1;
-            int could_be_generic = 0;
-            
-            while (lookahead < end && isspace(*lookahead)) lookahead++;
-            if (lookahead < end && (isalpha(*lookahead) || *lookahead == '_')) {
-                int depth = 1;
-                lookahead++;
-                while (lookahead < end && depth > 0) {
-                    if (*lookahead == '<') depth++;
-                    else if (*lookahead == '>') depth--;
-                    else if (*lookahead == ';' || *lookahead == '{') break;
-                    lookahead++;
-                }
                 
-                if (depth == 0 && lookahead < end) {
-                    while (lookahead < end && isspace(*lookahead)) lookahead++;
-                    if (lookahead < end && (*lookahead == '(' || *lookahead == '=' || *lookahead == '{' || 
-                        (lookahead + 1 < end && *lookahead == '=' && *(lookahead + 1) == '>'))) {
-                        could_be_generic = 1;
+            case TOKEN_LT:
+                // Check if this is a generic or comparison operator
+                // Look back to see if preceded by identifier/close paren
+                {
+                    int looks_like_generic = 0;
+                    
+                    // Look back for identifier (skip whitespace/newlines)
+                    if (i > 0) {
+                        size_t prev = i - 1;
+                        while (prev > 0 && ast->tokens[prev].type == TOKEN_CODE) {
+                            char c = *ast->tokens[prev].start;
+                            if (!isspace(c) && c != '\n') {
+                                // Found non-whitespace - check if identifier-like
+                                if (isalnum(c) || c == '_' || c == ')') {
+                                    looks_like_generic = 1;
+                                }
+                                break;
+                            }
+                            prev--;
+                        }
+                    }
+                    
+                    if (looks_like_generic) {
+                        // Try to find matching > and see what follows
+                        int depth = 1;
+                        size_t lookahead = i + 1;
+                        int found_match = 0;
+                        
+                        while (lookahead < ast->count && depth > 0) {
+                            if (ast->tokens[lookahead].type == TOKEN_LT) depth++;
+                            else if (ast->tokens[lookahead].type == TOKEN_GT) {
+                                depth--;
+                                if (depth == 0) {
+                                    found_match = 1;
+                                    break;
+                                }
+                            }
+                            lookahead++;
+                        }
+                        
+                        // Check what follows the closing >
+                        if (found_match) {
+                            lookahead++; // Move past >
+                            // Skip whitespace
+                            while (lookahead < ast->count && ast->tokens[lookahead].type == TOKEN_CODE) {
+                                char c = *ast->tokens[lookahead].start;
+                                if (!isspace(c) && c != '\n') break;
+                                lookahead++;
+                            }
+                            
+                            // Generic if followed by (, {, =, or =>
+                            if (lookahead < ast->count) {
+                                Token follow = ast->tokens[lookahead];
+                                if (follow.type == TOKEN_CODE) {
+                                    char c = *follow.start;
+                                    if (c == '(' || c == '{') {
+                                        looks_like_generic = 1;
+                                    } else {
+                                        looks_like_generic = 0; // Probably comparison
+                                    }
+                                } else if (follow.type == TOKEN_EQ) {
+                                    // Could be => arrow function
+                                    if (lookahead + 1 < ast->count && ast->tokens[lookahead + 1].type == TOKEN_GT) {
+                                        looks_like_generic = 1;
+                                    } else {
+                                        looks_like_generic = 1; // Type alias: type Foo<T> =
+                                    }
+                                }
+                            }
+                        } else {
+                            looks_like_generic = 0; // No matching >, must be comparison
+                        }
+                    }
+                    
+                    if (looks_like_generic) {
+                        // Skip the generic: < ... >
+                        int depth = 1;
+                        i++; // Skip the <
+                        while (i < ast->count && depth > 0) {
+                            if (ast->tokens[i].type == TOKEN_LT) depth++;
+                            else if (ast->tokens[i].type == TOKEN_GT) {
+                                depth--;
+                                if (depth == 0) {
+                                    i++; // Skip the closing >
+                                    break;
+                                }
+                            }
+                            i++;
+                        }
+                        i--; // Adjust for loop increment
+                    } else {
+                        // It's a comparison operator, preserve it
+                        sb_append_format(output, "%c", *token.start);
                     }
                 }
-            }
-            
-            if (could_be_generic) {
-                int depth = 1;
-                p++;
-                while (p < end && depth > 0) {
-                    if (*p == '<') depth++;
-                    else if (*p == '>') {
-                        depth--;
-                        if (depth == 0) {
-                            p++;
+                break;
+                
+            case TOKEN_INTERFACE:
+                // Skip interface declarations entirely
+                i++; // Skip past interface keyword
+                while (i < ast->count && ast->tokens[i].type != TOKEN_EOF) {
+                    if (ast->tokens[i].type == TOKEN_CODE) {
+                        const char *c = ast->tokens[i].start;
+                        if (*c == '{') {
+                            // Skip to matching }
+                            int brace_count = 1;
+                            i++;
+                            while (i < ast->count && brace_count > 0) {
+                                if (ast->tokens[i].type == TOKEN_CODE) {
+                                    if (*ast->tokens[i].start == '{') brace_count++;
+                                    else if (*ast->tokens[i].start == '}') brace_count--;
+                                }
+                                i++;
+                            }
+                            break;
+                        } else if (*c == '\n') {
                             break;
                         }
                     }
-                    p++;
+                    i++;
                 }
-                *ptr = p;
-                return 1;
-            }
+                i--; // Adjust for loop increment
+                break;
+                
+            case TOKEN_TYPE:
+                // Skip type alias declarations: type X = Y;
+                i++; // Skip past 'type' keyword
+                while (i < ast->count && ast->tokens[i].type != TOKEN_EOF) {
+                    Token t = ast->tokens[i];
+                    if (t.type == TOKEN_CODE) {
+                        char c = *t.start;
+                        if (c == ';' || c == '\n') {
+                            if (c == ';') i++;
+                            break;
+                        }
+                    }
+                    i++;
+                }
+                i--;
+                break;
+                
+            case TOKEN_COLON:
+                // Skip type annotation after colon
+                i++;
+                int depth = 0;
+                while (i < ast->count) {
+                    Token t = ast->tokens[i];
+                    
+                    // Track nesting depth for complex types
+                    if (t.type == TOKEN_LT) depth++;
+                    else if (t.type == TOKEN_GT) {
+                        if (depth > 0) depth--;
+                    }
+                    
+                    // Stop at delimiter when not nested
+                    if (depth == 0 && t.type == TOKEN_CODE) {
+                        char c = *t.start;
+                        if (c == ',' || c == ';' || c == '{' || c == '}' || c == '\n' || c == ')') {
+                            i--;
+                            break;
+                        }
+                    }
+                    
+                    // Also stop at = when not nested (for variable declarations)
+                    if (depth == 0 && t.type == TOKEN_EQ) {
+                        i--;
+                        break;
+                    }
+                    
+                    i++;
+                }
+                break;
+                
+            case TOKEN_IMPLEMENTS:  {
+                sb_append(output, " ");
+                i++; // Skip 'implements' tokense
+                sb_append(output, " ");
+                while (i < ast->count && ast->tokens[i].type != TOKEN_EOF) {
+                    if (ast->tokens[i].type == TOKEN_CODE && *ast->tokens[i].start == '{') {
+                        i--;
+                        break;
+                    }
+                    i++;
+                }
+                break;
+                
+            case TOKEN_AS:
+                // Skip as type assertion
+                sb_append(output, " ");
+                i++;
+                while (i < ast->count) {
+                    if (ast->tokens[i].type == TOKEN_CODE) {
+                        char c = *ast->tokens[i].start;
+                        if (!isalnum(c) && c != '_' && c != '.' && c != '<' && c != '>') {
+                            i--;
+                            break;
+                        }
+                    }
+                    i++;
+                }
+                break;
+                
+            case TOKEN_OPTIONAL:
+                // Skip ?: but keep :
+                sb_append(output, ":");
+                break;
+                
+            case TOKEN_PRIVATE:
+                // Skip private keyword
+                break;
+                
+            case TOKEN_EOF:
+                break;
         }
     }
-
-    // Strip "as" type assertions
-    if (p + 3 < end && p > source && *(p - 1) == ' ' && 
-        strncmp(p, KEYWORDS_TO_STRIP[KW_AS], 2) == 0 && *(p + 2) == ' ') {
-        p += 4;
-        while (p < end && isspace(*p)) p++;
-        
-        while (p < end && (isalnum(*p) || *p == '_' || *p == '.' || *p == '<' || *p == '>')) {
-            if (*p == '<') {
-                int depth = 1;
-                p++;
-                while (p < end && depth > 0) {
-                    if (*p == '<') depth++;
-                    else if (*p == '>') depth--;
-                    p++;
-                }
-            } else {
-                p++;
-            }
-        }
-        sb_append(output, " ");
-        *ptr = p;
-        return 1;
-    }
-
-    // Strip "implements" clause
-    if (p + 10 < end && strncmp(p, KEYWORDS_TO_STRIP[KW_IMPLEMENTS], 10) == 0 && *(p + 10) == ' ') {
-        p += 11;
-        while (p < end && *p != '{') p++;
-        sb_append(output, " ");
-        *ptr = p;
-        return 1;
-    }
-
-    // Remove "?:" optional parameter markers (but keep ternary operators)
-    if (*p == PATTERNS_TO_STRIP[PATTERN_OPTIONAL][0] && p + 1 < end && *(p + 1) == PATTERNS_TO_STRIP[PATTERN_OPTIONAL][1]) {
-        p++; // skip the ?
-        *ptr = p;
-        return 1;
-    }
-// Strip "private" keyword
-    if (strncmp(p, KEYWORDS_TO_STRIP[KW_PRIVATE], 7) == 0 && (p + 7 >= end || (!isalnum(*(p + 7)) && *(p + 7) != '_'))) {
-        p += 7;
-        while (p < end && isspace(*p)) p++;
-        *ptr = p;
-        return 1;
-    }
-
+}
     
-    return 0;
+    return sb_to_string(output);
+}
+
+// ============================================================================
+// High-level API
+// ============================================================================
+
+char* strip_types(const char *source, size_t size) {
+    AST *ast = lex(source, size);
+    if (!ast) {
+        return NULL;
+    }
+    
+    char *result = parse(ast, source);
+    ast_free(ast);
+    return result;
+}
+
+void ast_free(AST *ast) {
+    if (ast) {
+        free(ast->tokens);
+        free(ast);
+    }
 }

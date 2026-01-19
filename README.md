@@ -13,13 +13,41 @@ A lightweight C-based parser that strips TypeScript/Flow type annotations from J
 
 ## Architecture
 
-This parser demonstrates fundamental parsing principles using three core components:
+This parser demonstrates fundamental parsing principles using a **two-stage architecture**:
 
-1. **Input Buffer** - Source code to be parsed
-2. **Output Buffer** - Resulting JavaScript without type annotations
-3. **State Machine** (enum-based) - Tracks parser context (code, string, comment states)
+### Stage 1: Lexer
 
-These three variables form the foundation of any lexical parser, enabling context-aware character processing.
+The lexer (`lex()` function) tokenizes source code into an Abstract Syntax Tree (AST):
+
+- **Input**: Raw TypeScript/Flow source code
+- **Output**: Array of tokens with type, position, and line information
+- **Token Types**:
+  - Code tokens: `TOKEN_CODE`, `TOKEN_STRING`, `TOKEN_BLOCK_COMMENT`, `TOKEN_LINE_COMMENT`
+  - TypeScript constructs: `TOKEN_INTERFACE`, `TOKEN_TYPE`, `TOKEN_IMPLEMENTS`, `TOKEN_AS`, `TOKEN_PRIVATE`
+  - Type patterns: `TOKEN_COLON`, `TOKEN_GENERIC_START/END`, `TOKEN_OPTIONAL`
+
+### Stage 2: Parser
+
+The parser (`parse()` function) processes the token stream to strip types:
+
+- **Input**: AST from lexer
+- **Output**: Plain JavaScript string
+- **Logic**: Iterates through tokens, preserving code/strings/comments while skipping type-related tokens
+
+### Benefits of Two-Stage Design
+
+- **Separation of Concerns**: Lexer handles character→token, parser handles token→output
+- **Debuggability**: Inspect AST between stages
+- **Extensibility**: Modify lexer or parser independently
+- **Reusability**: AST can be used for other purposes (analysis, transformation, etc.)
+
+### Core Parsing Principles
+
+The architecture demonstrates three fundamental components of any parser:
+
+1. **Input Buffer** - Source code
+2. **Output Buffer** - Transformed result
+3. **State Machine** - Context tracking (lexer state enum)
 
 ## Installation
 
@@ -72,11 +100,12 @@ ast-project/
 │   ├── src/
 │   │   ├── main.c       # Entry point and CLI handling
 │   │   └── analyzer/
-│   │       ├── analyzer.h   # Analyzer interface
-│   │       └── analyzer.c   # Type stripper with state machine parser
+│   │       ├── analyzer.h   # Analyzer interface (lex, parse, strip_types APIs)
+│   │       └── analyzer.c   # Lexer and parser implementation
 │   ├── test/
-│   │   ├── example.ts   # Example TypeScript file for testing
-│   │   └── example.c    # Example C file
+│   │   ├── example.ts       # Example TypeScript file for testing
+│   │   └── build/           # Output directory for generated JavaScript
+│   │       └── example.js   # Generated JavaScript output
 │   └── Makefile         # Build configuration
 ├── README.md            # This file
 └── .gitignore          # Git ignore rules
@@ -84,39 +113,80 @@ ast-project/
 
 ## How It Works
 
-The type stripper uses a **state machine parser** with the following approach:
+The type stripper uses a **two-stage lexer+parser architecture**:
 
-1. **Input Buffer**: Reads TypeScript/Flow source code into memory
-2. **State Machine**: Tracks parser context with four states:
+### Stage 1: Lexical Analysis (Lexer)
+
+The lexer tokenizes source code character-by-character into an Abstract Syntax Tree (AST):
+
+1. **State Machine**: Tracks context with four lexer states:
+
    - `STATE_CODE` - Normal code processing
-   - `STATE_STRING` - Inside string literals (preserve content)
+   - `STATE_STRING` - Inside string literals (preserve as single token)
    - `STATE_BLOCK_COMMENT` - Inside `/* */` comments (preserve)
    - `STATE_LINE_COMMENT` - Inside `//` comments (preserve)
-3. **Output Buffer**: Dynamically builds the stripped JavaScript output
-4. **Type Detection**: In CODE state, identifies and removes:
-   - Type annotations (`: type`)
-   - Interface declarations (`interface X { }`)
-   - Type aliases (`type X = Y`)
-   - Generics (`<T>`)
-   - `implements` clauses
-   - `as` type assertions
-   - Optional parameter markers (`?:`)
 
-The parser reads character-by-character, switching states based on context to ensure types are only stripped from actual code, not from strings or comments.
+2. **Token Recognition**: Identifies TypeScript constructs:
 
-## Example Output
+   - Keywords: `interface`, `type`, `implements`, `as`, `private`
+   - Patterns: Type annotations (`:`), generics (`<>`), optional parameters (`?:`)
+   - Regular code, strings, and comments
 
-Given [example.ts](c/test/example.ts) with TypeScript:
+3. **AST Output**: Array of tokens, each containing:
+   - Token type (enum)
+   - Pointer to start position in source
+   - Length of token
+   - Line number
 
-```typescript
-interface User {
-  id: number;
-  name: string;
-}
+### Stage 2: Parsing (Type Stripping)
 
-function getUser(id: number): User {
-  return { id: 1, name: "John" };
-}
+The parser processes the token stream to generate clean JavaScript:
+
+1. **Token Iteration**: Loops through AST tokens
+2. **Selective Preservation**:
+   - **Preserve**: `TOKEN_CODE`, `TOKEN_STRING`, `TOKEN_BLOCK_COMMENT`, `TOKEN_LINE_COMMENT`
+   - **Skip/Remove**: Type-related tokens (interface, type annotations, generics, etc.)
+3. **Smart Removal**:
+   - Interface declarations: Skip to matching brace or newline
+   - Type annotations: Skip from `:` to delimiter (`,`, `;`, `=`, etc.)
+   - Generics: Skip `<T>` patterns
+   - `implements` clauses: Skip to `{`
+   - `as` assertions: Skip type expression
+   - `private` keyword: Remove entirely
+4. **Output Building**: Concatenates preserved tokens into output buffer
+
+### High-Level API
+
+```c
+char* strip_types(const char *source, size_t size) {
+    AST *ast = lex(source, size);      // Stage 1: Tokenize
+    char *result = parse(ast, source); // Stage 2: Strip types
+    ast_free(ast);                     // Cleanupbuild/example.js
+- `make clean` - Remove build artifacts
+- `make help` - Show available targets
+
+## Development
+
+To extend the type stripper:
+
+### Adding New Token Types
+1. Add token type to `TokenType` enum in [analyzer.h](c/src/analyzer/analyzer.h)
+2. Implement recognition logic in `lex()` function in [analyzer.c](c/src/analyzer/analyzer.c)
+3. Add handling logic in `parse()` function
+
+### Modifying Stripping Behavior
+1. Locate the token case in `parse()` switch statement
+2. Modify the skipping/preservation logic
+3. Test with [c/test/example.ts](c/test/example.ts)
+
+### Architecture Benefits
+The **two-stage lexer+parser** design provides:
+- **Debuggability**: Inspect AST tokens between stages
+- **Modularity**: Modify lexer or parser independently
+- **Testability**: Test tokenization and transformation separately
+- **Reusability**: Use the lexer for other AST-based tools
+
+Rebuild with `make` in the `c/` directory after changes
 ```
 
 The stripper produces pure JavaScript:

@@ -1,6 +1,9 @@
 # Chat conversation tracking (excluded from version control)
 chat-conversation.md
 
+# Copilot instructions (personal preferences)
+.github/copilot-instructions.md
+
 # Build outputs (C)
 c/ast-analyzer
 c/ast-analyzer.exe
